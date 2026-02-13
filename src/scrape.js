@@ -21,16 +21,7 @@ function parseArgs(argv) {
       continue;
     }
 
-    if (arg.startsWith("--limit=")) {
-      limit = Number(arg.split("=")[1]);
-      continue;
-    }
-
     cityParts.push(arg);
-  }
-
-  if (!Number.isFinite(limit) || limit <= 0) {
-    limit = 150;
   }
 
   return {
@@ -58,7 +49,7 @@ function normalizeImageUrl(url) {
 }
 
 (async () => {
-  const { city, limit: maxData, headless } = parseArgs(process.argv.slice(2));
+  const { city, limit: MAX_DATA, headless } = parseArgs(process.argv.slice(2));
   const searchQuery = `coffee shop in ${city}`;
   const searchUrl = `https://www.google.com/maps/search/${encodeURIComponent(
     searchQuery
@@ -80,7 +71,7 @@ function normalizeImageUrl(url) {
   );
 
   console.log(`Pages loaded for query: "${searchQuery}"`);
-  console.log(`Target rows: ${maxData}`);
+  console.log(`Target rows: ${MAX_DATA}`);
   await page.waitForSelector('div[role="article"]', { timeout: 60000 });
 
   console.log("Start scraping...");
@@ -90,7 +81,8 @@ function normalizeImageUrl(url) {
     phone: { type: "UTF8", optional: true },
     rating: { type: "UTF8", optional: true },
     total_reviews: { type: "UTF8", optional: true },
-    image: { type: "UTF8", optional: true },
+    cover_image: { type: "UTF8", optional: true },
+    gallery_images: { type: "UTF8", optional: true },
     place_url: { type: "UTF8", optional: true },
     reviews: { type: "UTF8", optional: true },
     lat: { type: "DOUBLE", optional: true },
@@ -100,16 +92,12 @@ function normalizeImageUrl(url) {
   const outputPath = path.join(__dirname, `maps_${fileSlug}.parquet`);
   const writer = await parquet.ParquetWriter.openFile(schema, outputPath);
 
-  const MAX_DATA = maxData;
-  const MAX_NO_NEW_CARD_ROUNDS = 8;
-  const seen = new Set();
-  let duplicateCount = 0;
-  let noNewCardRounds = 0;
-  let lastCardCount = 0;
   let results = [];
   let index = 0;
+  let noNewRounds = 0;
+  const seen = new Set();
 
-  while (results.length < MAX_DATA && noNewCardRounds < MAX_NO_NEW_CARD_ROUNDS) {
+  while (results.length < MAX_DATA && noNewRounds < 8) {
     const cards = await page.$$('div[role="article"]');
 
     if (index >= cards.length) {
@@ -117,29 +105,21 @@ function normalizeImageUrl(url) {
       await page.mouse.wheel(0, 6000);
       await page.waitForTimeout(2500);
 
-      const afterScrollCount = await page.$$eval(
+      const newCount = await page.$$eval(
         'div[role="article"]',
         (els) => els.length
       );
 
-      if (afterScrollCount <= cards.length) {
-        noNewCardRounds++;
-        console.log(
-          `No new cards loaded (${noNewCardRounds}/${MAX_NO_NEW_CARD_ROUNDS})`
-        );
-      } else {
-        noNewCardRounds = 0;
-        lastCardCount = afterScrollCount;
-      }
+      if (newCount <= cards.length) noNewRounds++;
+      else noNewRounds = 0;
 
       continue;
     }
 
-    const card = cards[index];
-    index++;
+    const card = cards[index++];
+    await card.scrollIntoViewIfNeeded();
 
     try {
-      await card.scrollIntoViewIfNeeded();
       await card.click();
     } catch (err) {
       console.log("Skip card click error:", err.message);
@@ -152,16 +132,9 @@ function normalizeImageUrl(url) {
       continue;
     }
 
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(3500);
     const data = await page.evaluate(() => {
-      const cleanText = (value) => {
-        if (!value) return null;
-        const cleaned = value
-          .replace(/^[^\p{L}\p{N}]+/gu, "")
-          .replace(/\s+/g, " ")
-          .trim();
-        return cleaned || null;
-      };
+      const cleanText = (v) => (v ? v.replace(/\s+/g, " ").trim() : null);
 
       // NAME
       const name = cleanText(document.querySelector("h1.DUwDvf")?.innerText);
@@ -190,36 +163,41 @@ function normalizeImageUrl(url) {
             ?.innerText.replace(/[()]/g, "")
             .trim() || null;
       }
+      let cover_image = null;
 
       // IMAGE
-      const galleryImage = Array.from(document.querySelectorAll("img"))
+      const coverImg = document.querySelector(
+        'button img[src*="lh3.googleusercontent.com"]'
+      );
+
+      if (coverImg) {
+        cover_image = coverImg.src;
+      }
+
+      let gallery = [];
+
+      const imgs = Array.from(document.querySelectorAll("img"))
         .map((img) => img.src)
-        .find((src) => src && src.includes("googleusercontent.com/p/"));
+        .filter(
+          (src) =>
+            src &&
+            src.includes("lh3.googleusercontent.com") &&
+            !src.includes("staticmap") &&
+            !src.includes("maps")
+        );
 
-      const image =
-        galleryImage ||
-        document.querySelector("button img")?.src ||
-        document.querySelector('meta[property="og:image"]')?.content ||
-        null;
-
-      const place_url = window.location.href;
-
-      // LAT LNG
-      const match = place_url.match(
-        /@(-?\d+\.\d+),(-?\d+\.\d+)/
-      );
-
-      // REVIEWS (3)
+      imgs.slice(0, 3).forEach((src) => gallery.push(src));
+      
       let reviews = [];
-      const reviewEls = document.querySelectorAll(
-        'div[data-review-id]'
-      );
+      const reviewEls = document.querySelectorAll("div.MyEned");
 
       reviewEls.forEach((r, i) => {
-        if (i < 3) {
-          reviews.push(r.innerText.trim());
-        }
+        if (i < 3) reviews.push(cleanText(r.innerText));
       });
+
+      // URL + LAT LNG
+      const place_url = window.location.href;
+      const match = place_url.match(/@(-?\d+\.\d+),(-?\d+\.\d+)/);
 
       return {
         name,
@@ -227,7 +205,8 @@ function normalizeImageUrl(url) {
         phone,
         rating,
         total_reviews,
-        image,
+        cover_image,
+        gallery_images: JSON.stringify(gallery),
         place_url,
         reviews: JSON.stringify(reviews),
         lat: match ? parseFloat(match[1]) : null,
@@ -235,45 +214,35 @@ function normalizeImageUrl(url) {
       };
     });
 
-    data.image = normalizeImageUrl(data.image);
+    data.cover_image = normalizeImageUrl(data.cover_image);
 
-    const dedupeKey = [data.name, data.address]
-      .map((v) => (v || "").toLowerCase().trim())
-      .join("|");
+    try {
+      const g = JSON.parse(data.gallery_images);
+      data.gallery_images = JSON.stringify(
+        g.map((x) => normalizeImageUrl(x))
+      );
+    } catch {}
 
-    if (!data.name || !data.address) {
-      console.log("Skip incomplete data");
-      continue;
-    }
+    if (!data.name || !data.address) continue;
 
-    if (seen.has(dedupeKey)) {
-      duplicateCount++;
-      console.log(`Duplicate skipped: ${data.name}`);
-      continue;
-    }
+    const key = `${data.name}|${data.address}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
 
-    seen.add(dedupeKey);
-
+    // LOG
     console.log(`${results.length + 1}. ${data.name}`);
-    console.log("   Rating:", data.rating);
-    console.log("   Image:", data.image);
+    console.log("   Cover:", data.cover_image);
 
     results.push(data);
     await writer.appendRow(data);
 
-    if (cards.length > lastCardCount) {
-      lastCardCount = cards.length;
-    }
-
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1200);
   }
 
   await writer.close();
   await browser.close();
 
-  console.log("\ndone!");
-  console.log(`Saved rows: ${results.length}`);
-  console.log(`Duplicates skipped: ${duplicateCount}`);
-  console.log(`Unique cards seen: ${seen.size}`);
+  console.log("\ddone!");
+  console.log("Saved:", results.length);
   console.log("save on:", outputPath);
 })();
